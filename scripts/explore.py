@@ -25,7 +25,7 @@ SAMPLE_DIR = Path("data") / "spike"
 
 def open_zst_lines(path):
     try:
-        from compression import zstd # type: ignore
+        from compression import zstd # pyright: ignore[reportMissingImports]
         return zstd.open(path, "rt", encoding="utf-8")
     except ImportError:
         import zstandard
