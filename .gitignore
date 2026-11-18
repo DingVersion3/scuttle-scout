@@ -221,3 +221,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GRID data, never commit (hackathon data terms)
+data/
+*.zst
+*.jsonl
