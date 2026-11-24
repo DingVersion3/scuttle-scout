@@ -21,6 +21,7 @@ import json
 import sqlite3
 import statistics
 import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 DEFAULT_DATA = Path.home() / "data" / "grid-starter"
@@ -85,7 +86,7 @@ def iter_lines(path):
             yield from io.TextIOWrapper(reader, encoding="utf-8")
 
 
-def parse_series(path, series_id):
+def parse_series(path, series_id, session_valid=None):
     games = {}          # game_id -> game row dict
     teams = {}          # (game_id, team_id) -> team row dict
     players = {}        # (game_id, player_id) -> player row dict
@@ -93,15 +94,36 @@ def parse_series(path, series_id):
     positions = []
     events = []
     last_xy = {}        # (game_id, player_id) -> (x, y), to skip unchanged positions
+    game_sessions = {}  # game_id -> feed session where it first appeared
+    feed_session_valid = {}
+    rolled_back = set()
+    session = 1
+    previous_sequence = None
 
     for line in iter_lines(path):
         line = line.strip()
         if not line:
             continue
         envelope = json.loads(line)
+        try:
+            sequence = int(envelope["sequenceNumber"])
+        except (KeyError, TypeError, ValueError):
+            sequence = None
+        if sequence is not None:
+            if previous_sequence is not None and sequence < previous_sequence:
+                session += 1
+            previous_sequence = sequence
 
         for event in envelope.get("events") or []:
             state = event.get("seriesState") or {}
+            if "valid" in state:
+                feed_session_valid[session] = state["valid"] is True
+
+            if event.get("type") == "series-!started-game":
+                target = event.get("target") or {}
+                if target.get("id"):
+                    rolled_back.add(target["id"])
+
             current_gid = None
             current_t = None
 
@@ -109,6 +131,7 @@ def parse_series(path, series_id):
                 gid = game.get("id")
                 if not gid:
                     continue
+                game_sessions.setdefault(gid, session)
                 t = (game.get("clock") or {}).get("currentSeconds")
 
                 g = games.setdefault(gid, {
@@ -185,8 +208,28 @@ def parse_series(path, series_id):
                     actor_pos.get("x"), actor_pos.get("y"),
                 ))
 
+    metadata_validity = (session_valid or {}).get(str(series_id), {})
+    drop_reasons = {}
+    for gid in games:
+        if gid in rolled_back:
+            drop_reasons[gid] = "rolled back"
+            continue
+        game_session = game_sessions[gid]
+        valid = metadata_validity.get(game_session, feed_session_valid.get(game_session))
+        if valid is not True:
+            drop_reasons[gid] = "invalid session" if valid is False else "session validity unknown"
+    for gid in rolled_back:
+        drop_reasons[gid] = "rolled back"
+
+    kept_game_ids = [gid for gid in games if gid not in drop_reasons]
+    kept = set(kept_game_ids)
+    for game_order, gid in enumerate(kept_game_ids, 1):
+        games[gid]["game_order"] = game_order
+
     draft_rows = []
     for gid, actions in drafts.items():
+        if gid not in kept:
+            continue
         for a in actions:
             draft_rows.append((
                 gid,
@@ -197,18 +240,32 @@ def parse_series(path, series_id):
             ))
 
     return {
-        "games": list(games.values()),
-        "teams": list(teams.values()),
-        "players": list(players.values()),
-        "positions": positions,
-        "events": events,
+        "series_id": str(series_id),
+        "games": [games[gid] for gid in kept_game_ids],
+        "teams": [row for (gid, _), row in teams.items() if gid in kept],
+        "players": [row for (gid, _), row in players.items() if gid in kept],
+        "positions": [row for row in positions if row[0] in kept],
+        "events": [row for row in events if row[0] in kept],
         "draft": draft_rows,
+        "dropped": [
+            {"game_id": gid, "session": game_sessions.get(gid), "reason": reason}
+            for gid, reason in sorted(drop_reasons.items())
+        ],
     }
 
 
 def write_series(conn, parsed):
-    game_ids = [(g["game_id"],) for g in parsed["games"]]
-    # Re-ingesting a series replaces its old rows instead of duplicating them
+    series_id = parsed["series_id"]
+    stored_game_ids = {
+        row[0] for row in conn.execute("SELECT game_id FROM games WHERE series_id = ?", (series_id,))
+    }
+    current_game_ids = {g["game_id"] for g in parsed["games"]}
+    dropped_game_ids = {game["game_id"] for game in parsed["dropped"]}
+    # Keep old rows for games absent from the current feed; replace parsed games
+    # and explicitly dropped games, including games that are now all-filtered.
+    replaced_game_ids = current_game_ids | dropped_game_ids
+    missing_game_ids = stored_game_ids - replaced_game_ids
+    game_ids = [(game_id,) for game_id in sorted(replaced_game_ids)]
     for table in PER_GAME_TABLES:
         conn.executemany(f"DELETE FROM {table} WHERE game_id = ?", game_ids)
 
@@ -228,6 +285,7 @@ def write_series(conn, parsed):
     conn.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", parsed["events"])
     conn.executemany("INSERT OR REPLACE INTO draft VALUES (?, ?, ?, ?, ?)", parsed["draft"])
     conn.commit()
+    return missing_game_ids
 
 
 def early_density_report(conn, series_id, window_s=240):
@@ -293,6 +351,26 @@ def load_series_index(data_dir):
         return list(csv.DictReader(f))
 
 
+def load_session_validity(data_dir):
+    games_path = data_dir / "meta" / "games.csv"
+    if not games_path.exists():
+        return None
+    with open(games_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if "session_valid" not in (reader.fieldnames or []):
+            return None
+        validity = defaultdict(dict)
+        for row in reader:
+            if row.get("title") != "lol":
+                continue
+            try:
+                session = int(row["session"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            validity[str(row["series_id"])][session] = row.get("session_valid", "").strip().lower() == "true"
+    return dict(validity)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
@@ -305,6 +383,7 @@ def main():
 
     data_dir = args.data.expanduser()
     index = load_series_index(data_dir)
+    session_validity = load_session_validity(data_dir)
     if args.series:
         index = [row for row in index if row["series_id"] == args.series]
         if not index:
@@ -317,18 +396,40 @@ def main():
     conn.executescript(SCHEMA)
     migrate(conn)
 
+    dropped_by_reason = Counter()
+    dropped_series_by_reason = defaultdict(set)
+    missing_feed_series = set()
+    missing_feed_games = 0
     for i, row in enumerate(index, 1):
         path = data_dir / row["file"]
         if not path.exists():
             print(f"[{i}/{len(index)}] missing file {path}, skipping")
             continue
-        parsed = parse_series(path, row["series_id"])
-        write_series(conn, parsed)
+        parsed = parse_series(path, row["series_id"], session_validity)
+        missing_game_ids = write_series(conn, parsed)
+        missing_feed_games += len(missing_game_ids)
+        if missing_game_ids:
+            missing_feed_series.add(row["series_id"])
+        series_drops = Counter(game["reason"] for game in parsed["dropped"])
+        for game in parsed["dropped"]:
+            dropped_by_reason[game["reason"]] += 1
+            dropped_series_by_reason[game["reason"]].add(row["series_id"])
+        drop_summary = ", ".join(f"{reason}: {count}" for reason, count in sorted(series_drops.items()))
         print(
             f"[{i}/{len(index)}] {row['series_id']} {row['teams']}: "
             f"{len(parsed['games'])} games, {len(parsed['positions'])} positions, "
-            f"{len(parsed['events'])} events"
+            f"{len(parsed['events'])} events, {len(parsed['dropped'])} dropped"
+            f"{f' ({drop_summary})' if drop_summary else ''}"
         )
+
+    print(f"\nDropped games: {sum(dropped_by_reason.values())}")
+    for reason in sorted(dropped_by_reason):
+        series_ids = ", ".join(sorted(dropped_series_by_reason[reason]))
+        print(f"  {reason}: {dropped_by_reason[reason]} (series: {series_ids})")
+    print(
+        f"Games absent from current feeds retained unchanged: {missing_feed_games} "
+        f"(series: {', '.join(sorted(missing_feed_series)) or 'none'})"
+    )
 
     if args.series:
         early_density_report(conn, args.series)
